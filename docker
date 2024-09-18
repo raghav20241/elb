@@ -1,0 +1,34 @@
+FROM python:3.9-alpine
+
+WORKDIR /app
+
+# Update apk repo and install system dependencies for Python package compilation
+RUN apk update && \
+    apk add --no-cache gcc musl-dev libffi-dev openssl-dev cargo
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install AWS CLI (Note: consider using a specific version to ensure consistency)
+RUN apk --no-cache add aws-cli
+
+# Clean up unnecessary packages and cache to keep the image size down
+RUN apk del gcc musl-dev cargo && \
+    rm -rf /var/cache/apk/*
+
+COPY /ec2-automation/script.py  /app/ec2_automation/script.py
+COPY /unassigned_shards/unassigned_shards.py  /app/unassigned_shards/unassigned_shards.py
+COPY /key_rotation_automation/*.py  /app/key_rotation_automation/
+COPY /elb-automation/elb.py   /app/elb-automation/elb.py
+COPY init_pod.sh /app/init_pod.sh
+
+RUN chmod +x /app/ec2_automation/script.py
+RUN chmod +x /app/unassigned_shards/unassigned_shards.py
+RUN chmod +x /app/key_rotation_automation/main.py
+RUN chmod +x /app/elb-automation/elb.py
+RUN chmod +x /app/init_pod.sh
+
+RUN apk add --no-cache bash
+
+CMD ["/bin/bash", "init_pod.sh"]
