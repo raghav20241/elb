@@ -1,0 +1,219 @@
+import boto3
+import datetime
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import yaml
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+
+def get_sts_client(credentials=None):
+    """Get STS client with optional credentials."""
+    return boto3.client('sts', **(credentials or {}))
+
+def get_account_number():
+    """Get the AWS account number."""
+    sts_client = get_sts_client()
+    response = sts_client.get_caller_identity()
+    return response['Account']
+
+def assume_role(role_arn):
+    """Assume an IAM role and return temporary credentials."""
+    sts_client = get_sts_client()
+    response = sts_client.assume_role(RoleArn=role_arn, RoleSessionName='AssumeRoleSession')
+    credentials = response['Credentials']
+    return {
+        'aws_access_key_id': credentials['AccessKeyId'],
+        'aws_secret_access_key': credentials['SecretAccessKey'],
+        'aws_session_token': credentials['SessionToken']
+    }
+
+def find_unused_load_balancers(credentials, region):
+    """Find load balancers that are unused based on listeners and target groups."""
+    elb_client = boto3.client('elb', region_name=region, **credentials)
+    elbv2_client = boto3.client('elbv2', region_name=region, **credentials)
+
+    unused_load_balancers = []
+    account_number = get_account_number()  # Get the AWS account number
+
+    # Check Classic Load Balancers
+    classic_lbs = elb_client.describe_load_balancers().get('LoadBalancerDescriptions', [])
+    for lb in classic_lbs:
+        lb_name = lb['LoadBalancerName']
+        lb_dns_name = lb['DNSName']  # Classic Load Balancers use DNSName, not ARN
+
+        # Check if Classic Load Balancer has any instances
+        instances = elb_client.describe_instance_health(LoadBalancerName=lb_name)['InstanceStates']
+        if not instances:
+            status = 'No instances'
+            unused_load_balancers.append({
+                'Account': account_number,
+                'Region': region,
+                'ELBType': 'Classic',
+                'LoadBalancerName': lb_name,
+                'LoadBalancerArn': lb_dns_name,
+                'Status': status
+            })
+
+    # Check Application and Network Load Balancers
+    load_balancers = elbv2_client.describe_load_balancers().get('LoadBalancers', [])
+    for lb in load_balancers:
+        lb_arn = lb['LoadBalancerArn']
+        lb_name = lb['LoadBalancerName']
+        lb_type = lb['Type']
+
+        # Check if the load balancer has any listeners
+        listeners_response = elbv2_client.describe_listeners(LoadBalancerArn=lb_arn)
+        has_listeners = bool(listeners_response['Listeners'])
+        
+        # Check if the load balancer has any target groups
+        target_groups_response = elbv2_client.describe_target_groups(LoadBalancerArn=lb_arn)
+        target_groups = target_groups_response['TargetGroups']
+        has_target_groups = bool(target_groups)
+        
+        if lb_type in ['network', 'application']:
+            # Check each target group to see if it has any registered targets
+            all_targets_unused = True
+            for tg in target_groups:
+                targets_response = elbv2_client.describe_target_health(TargetGroupArn=tg['TargetGroupArn'])
+                targets = targets_response['TargetHealthDescriptions']
+                if targets:
+                    all_targets_unused = False
+                    break
+            if all_targets_unused:
+                status = 'Target groups have no registered targets'
+            elif not has_listeners and not has_target_groups:
+                status = 'No listeners and no target groups'
+            elif not has_listeners:
+                status = 'No listeners'
+            elif not has_target_groups:
+                status = 'No target groups'
+            else:
+                continue  # If there's at least one target registered, it's not considered unused
+
+            unused_load_balancers.append({
+                'Account': account_number,
+                'Region': region,
+                'ELBType': lb_type,
+                'LoadBalancerName': lb_name,
+                'LoadBalancerArn': lb_arn,
+                'Status': status
+            })
+
+    return unused_load_balancers
+
+def send_email(report_data, smtp_config):
+    """Send an email with the report of unused load balancers."""
+    subject = 'Daily Unused Load Balancer Report'
+    sender = smtp_config['sender']
+    recipients = smtp_config['recipients']
+
+    # Create the email message
+    message = MIMEMultipart()
+    message['From'] = sender
+    message['To'] = ", ".join(recipients)
+    message['Subject'] = subject
+
+    # Build the HTML body
+    body = "Daily report of unused load balancers:<br><br>"
+
+    # Group report data by account and region
+    account_data = {}
+    for row in report_data:
+        account = row['Account']
+        if account not in account_data:
+            account_data[account] = {}
+        region = row['Region']
+        if region not in account_data[account]:
+            account_data[account][region] = []
+        account_data[account][region].append(row)
+
+    # Create a separate table for each account
+    for account, regions in account_data.items():
+        body += f"<h3>Account: {account}</h3>"
+        for region, rows in regions.items():
+            html_table = f"<h4>Region: {region}</h4>"
+            html_table += "<table border='1' style='border-collapse: collapse;'>"
+            html_table += "<tr><th>ELB Type</th><th>Load Balancer Name</th><th>Load Balancer ARN/DNS</th><th>Status</th></tr>"
+
+            for row in rows:
+                html_table += "<tr>"
+                html_table += f"<td>{row['ELBType']}</td>"
+                html_table += f"<td>{row['LoadBalancerName']}</td>"
+                html_table += f"<td>{row['LoadBalancerArn']}</td>"
+                html_table += f"<td>{row['Status']}</td>"
+                html_table += "</tr>"
+            html_table += "</table><br>"
+            body += html_table
+
+    html_part = MIMEText(body, 'html')
+    message.attach(html_part)
+
+    try:
+        # Connect to the SMTP server
+        with smtplib.SMTP(smtp_config['server'], smtp_config['port'], timeout=smtp_config['timeout']) as server:
+            # Optionally start TLS if needed
+            # server.starttls()
+            # server.login('your-smtp-username', 'your-smtp-password')  # Skip login if not required
+
+            # Send the email
+            server.sendmail(sender, recipients, message.as_string())
+        logging.info("Report sent successfully via SMTP")
+        logging.info(f"Recipients: {recipients}")
+    except smtplib.SMTPException as e:
+        logging.error(f"SMTP error occurred: {e}")
+    except Exception as e:
+        logging.error(f"Failed to send email: {e}")
+
+def read_config():
+    """Read configuration from a YAML file."""
+    try:
+        with open('/etc/conf/config.yaml') as f:
+            config_data = yaml.safe_load(f)
+        regions = config_data.get('region', '').split(',')
+        role_arns = config_data.get('arnRoles', [])
+        smtp_config = {
+            'server': config_data.get('smtp', {}).get('server', ''),
+            'port': config_data.get('smtp', {}).get('port', 25),
+            'timeout': config_data.get('smtp', {}).get('timeout', 60),
+            'recipients': config_data.get('email', {}).get('recipients', '').split(','),
+            'sender': config_data.get('email', {}).get('sender', '')
+        }
+        return regions, role_arns, smtp_config
+    except Exception as e:
+        logging.error(f"Error reading config file: {e}")
+        return [], [], {}
+
+def main():
+    """Main function to find unused load balancers and send report."""
+    regions, role_arns, smtp_config = read_config()
+    all_unused_load_balancers = []
+
+    for arn_role in role_arns:
+        credentials = assume_role(arn_role)
+        for region in regions:
+            try:
+                unused_load_balancers = find_unused_load_balancers(credentials, region)
+                all_unused_load_balancers.extend(unused_load_balancers)
+            except Exception as e:
+                logging.error(f"Error processing region {region}: {e}")
+
+    if all_unused_load_balancers:
+        # Log the report of unused load balancers
+        logging.info("Unused Load Balancers Report:")
+        for lb in all_unused_load_balancers:
+            logging.info(f"Account: {lb['Account']}, Region: {lb['Region']}, ELB Type: {lb['ELBType']}, "
+                         f"Load Balancer Name: {lb['LoadBalancerName']}, Load Balancer ARN: {lb['LoadBalancerArn']}, "
+                         f"Status: {lb['Status']}")
+
+        # Send the report via email
+        send_email(all_unused_load_balancers, smtp_config)
+    else:
+        logging.info("No unused load balancers found.")
+
+    logging.info("elb-automation completed successfully")
+
+if __name__ == "__main__":
+    main()
