@@ -1,0 +1,126 @@
+namespace: devops-automation
+
+jobs:
+  - name: ec2-automation
+    suspend: true  # Suspend the CronJob initially
+    schedule: "0 * * * *"  # Schedule to run every 1 hour
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "2Gi"
+        cpu: "200m"
+    restartPolicy: Never
+    serviceAccount:
+      create: true
+      annotations:
+        eks.amazonaws.com/role-arn: "arn:aws:iam:::role/AWSEC2-stg"
+    configmap:
+      mountpath: /etc/conf/
+      data:
+        region: "us-east-1, eu-central-1"  #Can be added to any regions
+        arnRoles:
+#          - "arn:aws:iam:::role/AWSEC2-prod1" #AWS-Prod account
+          - "arn:aws:iam:::role/AWSEC2-stg"  #AWS-dev account
+        tags: #Tags to be used for EC2 scheduling automation
+          tag1: "Weekend"
+          tag2: "WeekdayStart"
+          tag3: "WeekdayStop"
+        email:
+          sender: "ec2-automation-no-reply@abccom"
+          recipients: "kam@abc.com"
+
+  - name: unassigned-shards
+    suspend: true
+    schedule: "0 * * * *"  # Schedule to run every 1 hour
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "100m"
+      limits:
+        memory: "1Gi"
+        cpu: "200m"
+    restartPolicy: Never
+    elasticurl: http://localhost:52463/
+
+  - name: key-rotation-automation
+    suspend: true
+    env: production
+    schedule: "0 5 * * *"  # Run every day at 5am
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "2Gi"
+        cpu: "200m"
+    restartPolicy: Never
+    serviceAccount:
+      create: true
+      annotations:
+        eks.amazonaws.com/role-arn: "arn:aws:iam:::role/key-rotation-automation-role"
+    configmap:
+      mountpath: /etc/conf/
+      data:
+        ignorUsersRegex: "SIEM_" # Configure the regular expression pattern to filter users
+        aws:
+          smRegion: "eu-central-1"
+          sesRegion: "us-east-1"
+          arnRoles: # the first arn in the main arn which the ses service while be used for email notifications
+            - "arn:aws:iam:::role/key-rotation-automation-role" # dev account
+        devopsEmail: "idso@abc.com"
+        senderEmail: "aws-users-notification@abc.com"
+
+        # Configure the number of days before an access key is considered expired
+        expirationThresholdDays: 2
+        # Configure the number of days to wait before automatically deleting an expired access key
+        deletionThresholdDays: 4
+        # Configure the frequency user will get notification for expiration access key, every X days
+        notificationEmailFrequency: 4
+        # Configure the number of days within which is the key was last used, it will not be deleted
+        lastUsedThresholdDays: 3
+
+        logLevel: INFO
+
+        tags:
+          enableUserNotificationTagKey: "access_key_expiration_enable"
+          enableUserNotificationTagValue: "true"
+
+          automationKeyForceDeleteTagKey: "automation_key_force_delete"
+          automationKeyForceDeleteTagValue: "true"
+
+          enableNewKeyCreationTagKey: "automation_new_key_creation"
+          enableNewKeyCreationTagValue: "true"
+
+          emailTagKey: "Email"
+
+          keyTrackerPrefix: "NotificationDate-"
+  - name: elb-automation
+    suspend: true
+    schedule: "35 11 * * *" # Run every day 
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "1Gi"
+        cpu: "200m"
+    restartPolicy: Never
+    serviceAccount:
+      create: true
+      annotations:
+        eks.amazonaws.com/role-arn: "arn:aws:iam:::role/elb-stg-role"
+    configmap:
+      mountpath: /etc/conf/
+      data:
+        region: "us-east-1,ap-east-1,eu-central-1"  #Can be added to any regions
+        arnRoles:
+          - "arn:aws:iam:::role/elb-stg-role" #dev account
+        email:
+          sender: "unhealthy-lb-no-reply@abc.com"
+          recipients: "raas@abc.com"  
+        smtp:
+          server: "172.22.10.25"
+          port: 25
+          timeout: 60
