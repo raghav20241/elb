@@ -1,0 +1,215 @@
+import boto3
+import datetime
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from tabulate import tabulate
+import yaml
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
+def get_sts_client(credentials=None):
+    if credentials is not None:
+        return boto3.client('sts', **credentials)
+    else:
+        return boto3.client('sts')
+
+def assume_role(role_arn):
+    sts_client = get_sts_client()
+    response = sts_client.assume_role(RoleArn=role_arn, RoleSessionName='AssumeRoleSession')
+    credentials = response['Credentials']
+    return {
+        'aws_access_key_id': credentials['AccessKeyId'],
+        'aws_secret_access_key': credentials['SecretAccessKey'],
+        'aws_session_token': credentials['SessionToken']
+    }
+
+def get_current_day_and_time():
+    now_local = datetime.datetime.now()
+    return now_local.strftime('%A'), now_local.strftime('%H:%M')
+
+# Function to check if a given day is a weekend day
+def is_weekend(day, weekend_days):
+    if weekend_days:
+        return day in weekend_days.split(',')
+    else:
+        return False
+
+# Function to parse day and time
+def parse_day_and_time(day_time_str):
+    try:
+        time_str, day_str = day_time_str.split(',')
+    except ValueError:
+        time_str = day_time_str
+        day_str = None
+    return time_str.strip(), day_str.strip() if day_str else None
+
+# Function to check time for action
+def check_time_for_action(current_day, current_time_str, start_day_time, stop_day_time):
+    start_time_str, start_day = parse_day_and_time(start_day_time)
+    stop_time_str, stop_day = parse_day_and_time(stop_day_time)
+
+    current_time = datetime.datetime.strptime(current_time_str, '%H:%M')
+    start_time = datetime.datetime.strptime(start_time_str, '%H:%M')
+    stop_time = datetime.datetime.strptime(stop_time_str, '%H:%M')
+
+    # Check if it's the first case: only time is specified
+    if start_day is None and stop_day is None:
+        start_time_diff = (start_time - current_time).total_seconds()
+        stop_time_diff = (stop_time - current_time).total_seconds()
+
+        # If the current time is within 20 minutes of the specified time, take action accordingly
+        if -20 * 60 <= start_time_diff <= 20 * 60:
+            return 'start'
+        elif -20 * 60 <= stop_time_diff <= 20 * 60:
+            return 'stop'
+
+    # Check if it's the second case: both day and time are specified
+    elif start_day and stop_day:
+        if start_day == current_day:
+            start_time_diff = (start_time - current_time).total_seconds()
+
+            # If the current time is within 20 minutes of the specified start time, take start action
+            if -20 * 60 <= start_time_diff <= 20 * 60:
+                return 'start'
+        elif stop_day == current_day:
+            stop_time_diff = (stop_time - current_time).total_seconds()
+
+            # If the current time is within 20 minutes of the specified stop time, take stop action
+            if -20 * 60 <= stop_time_diff <= 20 * 60:
+                return 'stop'
+
+    return None
+
+# Function to get EC2 client
+def get_ec2_client(region, credentials=None):
+    return boto3.client('ec2', region_name=region.strip(), **credentials)
+
+# Function to manage EC2 instances
+def manage_ec2_instances(role_arns, regions, tags, sender, recipients):
+    for arn_role in role_arns:
+        credentials = assume_role(arn_role)
+
+        # Initialize table data for tabulate
+        table_headers = ['Instance Name', 'Instance ID', 'Instance State', 'Weekend', 'Weekday Start', 'Weekday Stop', 'Action', 'Current Time', 'Remark', 'Region']
+        table_data = []
+
+        any_action_taken = False
+        # Get AWS account name
+        sts_client = get_sts_client(credentials)
+        account_name = sts_client.get_caller_identity()['Account']
+
+        for region in regions:
+            try:
+                ec2 = get_ec2_client(region, credentials)
+
+                table = []
+                instances = ec2.describe_instances()
+                # Initialize details
+                for reservation in instances['Reservations']:
+                    for instance in reservation['Instances']:
+                        instance_id = instance['InstanceId']
+                        instance_name = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), '')
+                        instance_state = instance['State']['Name']
+
+                        tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
+                        # Tags to be used in EC2 instance
+                        weekend = tags.get('Weekend')
+                        weekday_start = tags.get('WeekdayStart')
+                        weekday_stop = tags.get('WeekdayStop')
+
+                        if not any([weekday_start, weekday_stop]):
+                            continue
+
+                        today, current_time = get_current_day_and_time()
+
+                        if is_weekend(today, weekend):
+                            table.append([instance_name, instance_id, instance_state, weekend, weekday_start, weekday_stop, 'N/A', current_time, 'Skipping due to weekend', region])
+                            continue
+
+                        action = check_time_for_action(today, current_time, weekday_start, weekday_stop)
+
+                        remark = ''
+                        if action == 'start':
+                            ec2.start_instances(InstanceIds=[instance_id])
+                            remark = 'Instance started'
+                            any_action_taken = True
+                        elif action == 'stop':
+                            ec2.stop_instances(InstanceIds=[instance_id])
+                            remark = 'Instance stopped'
+                            any_action_taken = True
+                        else:
+                            remark = 'Missed timing'
+
+                        table.append([instance_name, instance_id, instance_state, weekend, weekday_start, weekday_stop, action if action else 'N/A', current_time, remark, region])
+
+                headers = ['Instance Name', 'Instance ID', 'Instance State', 'Weekend', 'Weekday Start', 'Weekday Stop', 'Action', 'Current Time', 'Remark', 'Region']
+
+                # Print the table data for the current ARN role
+                print(f"AWS Account: {account_name}")
+                print(tabulate(table, headers=table_headers, tablefmt="grid"))
+
+                # Append instance data to table_data
+                table_data.extend(table)
+            except Exception as e:
+                logging.error(f"Error processing region {region}: {e}")
+
+        if any_action_taken:
+            send_email(table_headers, table_data, account_name, sender, recipients)
+
+# Function to send email
+def send_email(table_headers, table_data, account_name, sender, recipients):
+    subject = 'EC2 Instance Management Report'
+
+    message = MIMEMultipart()
+    message['From'] = sender
+    message['To'] = ", ".join(recipients)
+    message['Subject'] = subject
+
+    body = f"AWS Account: {account_name}<br><br>"
+    html_table = "<table border='1'>"
+    html_table += "<tr>"
+    for header in table_headers:
+        html_table += f"<th>{header}</th>"
+    html_table += "</tr>"
+
+    for row in table_data:
+        html_table += "<tr>"
+        for item in row:
+            html_table += f"<td>{item}</td>"
+        html_table += "</tr>"
+    html_table += "</table>"
+
+    body += html_table
+    html_part = MIMEText(body, 'html')
+    message.attach(html_part)
+
+    # Connect to the custom SMTP server
+    server = smtplib.SMTP('172.20.60.25', 25)
+
+    # Send the email
+    server.sendmail(sender, recipients, message.as_string())
+
+    # Close the connection
+    server.quit()
+
+    logging.info("Output sent using SMTP successfully")
+
+def read_configmap():
+    try:
+        with open('/etc/conf/config.yaml') as f:
+            config_data = yaml.safe_load(f)
+        regions = config_data.get('region', '').split(',')
+        role_arns = config_data.get('arnRoles', [])
+        tags = config_data.get('tags', {})
+        sender = config_data.get('email', {}).get('sender', '')
+        recipients = config_data.get('email', {}).get('recipients', '').split(',')
+        return regions, role_arns, tags, sender, recipients
+    except Exception as e:
+        logging.error(f"Error reading config file: {e}")
+        return [], [], {}, '', []
+
+if __name__ == "__main__":
+    regions, role_arns, tags, sender, recipients = read_configmap()
+    manage_ec2_instances(role_arns, regions, tags, sender, recipients)
