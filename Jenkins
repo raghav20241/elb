@@ -1,0 +1,283 @@
+/* ### Jenkinsfile ###
+Hey there,
+I'm Jenkinsfile and I rule the build process of current repository.
+I'm identical among all branches.
+Editing me, could fail builds.
+!!Please don't edit me unless you know what are you doing for 100%!!
+If you are only 99.9% sure, consult DevOps team. */
+
+// Define on which agent pipeline will run
+def agentLabel = "ec2-fleet"
+
+// Declare dynamic library
+cmlib = library(
+    identifier: 'jenkins-library@master',
+      changelog: "false",
+    retriever: modernSCM(
+        [
+            $class: 'GitSCMSource',
+            remote: 'https://git.itools.radwarecloud.com/scm/devops/jenkins-library.git',
+            // git clone user cmjen04 credentials
+            credentialsId: 'devops_creds'
+        ]
+    )
+)
+
+// Pipeline is starting here!
+pipeline {
+    // use any agent
+    agent {
+        label agentLabel
+    } // agent
+
+    environment {
+        // Git repository variables:
+        // Parse project key (Parse GIT_URL or GIT_URL_1(PR build). Output is a project key in lowercase)
+          projKey = buildMeta.projKey()
+        // Parse repository name (Parse GIT_URL or GIT_URL_1(PR build). Output is a repository name in lowercase)
+        repoName = buildMeta.repoName()
+        // replace / with - in branch name & apply lower case
+        c_BRANCH_NAME = buildMeta.c_BRANCH_NAME()
+        // Concatenate and create custom BUILD_TAG (repo_name-c_branch_name-build_number)
+        c_BUILD_TAG = buildMeta.c_BUILD_TAG(repoName, c_BRANCH_NAME)
+        // Edit repo name (use "-" instead of "_", due to helm is not supporting "_")
+        repoNameDash = buildMeta.repoNameDash(repoName)
+        // replace underscore ("_") with dash ("-")
+        branchNameDash = buildMeta.branchNameDash (c_BRANCH_NAME)
+
+        // rdwrcloud ci/cd tools urn
+        rdwrCloudToolsUrn = "repository.itools.radwarecloud.com"
+
+        // docker variables - nexus artifactory
+        // nxrm snapshots Docker urn
+        nxrmDocker = "docker-long-term"
+        // nxrm snapshots Docker urn
+        nxrmDockerUrn = "${nxrmDocker}.${rdwrCloudToolsUrn}"
+        // nxrm snapshots Docker url
+        nxrmDockerUrl = "https://${nxrmDockerUrn}"
+        // nxrm docker repo
+        nxrmDockerRepo = "rwc-portalng-images"
+        // nxrm devops repo
+        nermDevopsRepo = "devops-tools"
+        // nxrm Docker registry
+        nxrmDockerRegPath= "${nxrmDockerUrn}/${nxrmDockerRepo}/${repoName}"
+
+        // helm variables - nexus artifactory
+        // nxrm helm urn
+        nxrmUrn = "gui.${rdwrCloudToolsUrn}"
+        // NXRM https url
+        nxrmHttpsUrl = "https://${nxrmUrn}"
+        // NXRM repositories
+        nxrmRepos = "${nxrmHttpsUrl}/repository"
+        // NXRM helm repo
+        nxrmHelmRepo = "helm-long-term"
+
+        // devops imgs
+        // aws-kube img version
+        awsKubeImgVer = 3
+        // aws-kube img full tag
+        awsKubeImg = "${nxrmDockerUrn}/${nermDevopsRepo}/awscli-kubectl:${awsKubeImgVer}"
+        // helm-bash img version
+        helmBashImgVer = 1
+        // helm-bash img full tag
+        helmBashImg = "${nxrmDockerUrn}/${nermDevopsRepo}/helm-bash:${helmBashImgVer}"
+
+        // set build version
+        projectVersion = "${c_BRANCH_NAME}-${BUILD_NUMBER}"
+        // if it is PR - this var will get value
+        baseBranch = "${env.CHANGE_BRANCH}"
+        // set helm version - shared lib function
+        helmChartVersion = getHelmVersion(branchNameDash, BUILD_NUMBER)
+        // manifest repository
+        manifestRepo = "argo-manifest"
+
+        // credentials
+        // username and password
+        nxrmCreds = credentials("nexus-repository")
+
+        // username and password
+        gitCreds = credentials("devops_creds")
+        // devops user nxrm cred ID
+        nxrmCredsId = "devops_creds"
+
+        // docker vars
+        DOCKER_BUILDKIT = '1'
+
+    } // environment
+
+    triggers {
+        // Build when a changed is pushed to Bitbucket
+        bitbucketPush()
+    } // triggers
+
+    options {
+        disableConcurrentBuilds()
+        timeout(60)
+        timestamps()
+        buildDiscarder(logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '10', daysToKeepStr: '', numToKeepStr: '25'))
+    } // options
+
+    stages {
+        stage('Pre build') {
+            steps {
+                script {
+                    println "Define manifest repository branch"
+                    def manifestBranch = (GIT_BRANCH == "master") ? "master" : "dev"
+                    println "Delete ${manifestRepo} dir"
+                    sh "rm -rf ${WORKSPACE}/${manifestRepo}"
+                    println "Clone ${manifestRepo}"
+                    sh "git clone --single-branch --branch ${manifestBranch} https://${gitCreds}@git.itools.radwarecloud.com/scm/devops/${manifestRepo}.git"
+                } // script
+            } // steps
+        } // stage Pre build
+
+        stage("Docker build and push") {
+            steps {
+                script {
+                    println "building docker image"
+                    // check if its PR
+                    isPR = (env.CHANGE_ID) ? true : false
+                    // the docker image runs unit tests and sonar
+                    println "build docker image"
+                    def image = docker.build("${nxrmDockerRegPath}")
+                    // if not pull request
+                    if (!env.CHANGE_ID) {
+                        // login to 3rdpkgartifactory docker repo
+                        withDockerRegistry([credentialsId: "${nxrmCredsId}", url: "${nxrmDockerUrl}"]) {
+                            println "push docker image"
+                            image.push("${projectVersion}")
+                        } // withDockerRegistry
+                    } // if
+                } // script
+            } // steps
+        } // stage docker build and push
+
+        stage("Helm pack and push") {
+            steps {
+                dir("helm") {
+                    script {
+                        // edit the values of versions in values.yaml and in charts.yaml
+                        sh "sed -i 's/DOCKER_VERSION/${projectVersion}/g' values.yaml"
+                        sh "sed -i 's/appVersion: 1.0.0/appVersion: ${projectVersion}/g' Chart.yaml"
+                        sh "sed -i 's/version: 1.0.0/version: ${helmChartVersion}/g' Chart.yaml"
+
+                        // create helm package
+                        sh """
+                            docker run --rm -i --privileged --mount type=bind,source=${WORKSPACE}/helm/,target=/opt/data -e helmChartVersion=${helmChartVersion}\
+                            -e projectName=${repoName} ${helmBashImg} /bin/sh -c "cd /opt/data && helm template ./ > template.yaml \
+                                                        && helm lint && helm package ./ --version ${helmChartVersion} --debug"
+                        """
+
+                        // upload helm package - if not pull request
+                        if (!env.CHANGE_ID) {
+                            println "Push config to ${nxrmHttpsUrl}"
+                            sh """
+                                ls -la
+                                curl -u ${nxrmCreds} --upload-file ${repoName}-${helmChartVersion}.tgz -v ${nxrmRepos}/${nxrmHelmRepo}/
+                            """
+                        } // if
+
+                        // archive
+                        archiveArtifacts 'template.yaml'
+                        archiveArtifacts "${repoName}-${helmChartVersion}.tgz"
+                    } // script
+                } // dir
+            } // steps
+        } // stage Helm pack and push
+
+        stage("Edit manifest for tests") {
+            steps {
+                script {
+                    // set git revision for E2E
+                    gitRevision = (env.CHANGE_ID) ? CHANGE_BRANCH : GIT_BRANCH
+                    // edit manifest
+                    editManifest(serviceName: "${repoName}", gitRevision: "${gitRevision}", newImageVersion: "${projectVersion}")
+                } // script
+            } // steps
+              } // stage Edit manifest for tests
+              
+              stage ("Integration tests") {
+                          when { not {
+                              anyOf {
+                                  expression { BRANCH_NAME == 'dev' }
+                                  expression { BRANCH_NAME == "master" }
+                              } // anyOf
+                          } } // when not
+                          steps {
+                              println "run E2E tests"
+                          } // steps
+              } // stage Integration tests
+
+              stage ( "E2E") {
+                          when {
+                              anyOf {
+                                  expression { BRANCH_NAME == 'dev' }
+                                  expression { BRANCH_NAME == "master" }
+                              } // anyOf
+                          } // when
+                          steps {
+                              println "run E2E tests"
+                          } // steps
+              } // stage E2E
+
+        stage("Tag repo") {
+            when {
+                anyOf {
+                    expression { BRANCH_NAME == 'dev' }
+                    expression { BRANCH_NAME == "master" }
+                } // anyOf
+            } // when
+            steps {
+                println "tag repo"
+                sh """git tag -a "${c_BUILD_TAG}" -m "Message of ${c_BUILD_TAG}"
+                    git push https://"${gitCreds}"@git.itools.radwarecloud.com/scm/${projKey}/${repoName} --tag """
+                // delete local tag
+                sh "git tag -d ${c_BUILD_TAG}"
+            } // steps
+        } // stage Tag repo
+
+        stage('Manifest edit and push') {
+            // Only when on dev & master
+            when {
+                anyOf {
+                    expression { BRANCH_NAME == "master" }
+                    expression { BRANCH_NAME == "dev" }
+                } // anyOf
+            } // when
+            steps {
+                script {
+                    println "Edit manifest"
+                    gitRevision = "${c_BUILD_TAG}"
+                    editManifest(serviceName: "${repoName}", gitRevision: "${gitRevision}", newImageVersion: "${projectVersion}")
+                    // Push updated Manifest to argo-manifest repo (only on master or dev branches)
+                    println "Push update to manifest repo"
+                    pushManifest(manifestRepo: "${manifestRepo}", buildNumber: "${BUILD_NUMBER}", repoName: "${repoName}", branchName: "${c_BRANCH_NAME}", gitCreds: "${gitCreds}")
+                } // script
+            } // steps
+        } // stage Git push Manifest
+
+        stage("Sync argo") {
+            // Only when on dev branch
+            when {
+                expression { BRANCH_NAME == 'master' }
+            } // when
+            steps {
+                // sync clusters
+                println "sync argo apps"
+                script {
+                    syncArgo.sync(awsKubeImg: "${awsKubeImg}")
+                } // script
+            } // steps
+        } // stage Sync argo
+    } // stages
+    post {
+        always {
+            script {
+                // Print environment variables
+                sh "env"
+                cleanWs()
+            } // script
+        } // always
+    } // post
+} // pipeline
+
